@@ -1,6 +1,6 @@
 # Zervram (Open Core) - Cryptographic GPU VRAM Sanitizer & Heterogeneous HAL in Rust
 
-**Live Interactive Cluster & EAR 744.24 Firewall Console:** https://zervram/.netlify.app
+**Live Interactive Cluster & EAR 744.24 Firewall Console:** https://zervram.netlify.app
 
 zervram-open contains the open-source Rust hardware abstraction layer (zervram-hal) and post-job cryptographic VRAM scrubber (zervram-scrub) powering Zervram.
 
@@ -19,3 +19,4 @@ zervram-open contains the open-source Rust hardware abstraction layer (zervram-h
 
 ## License
 Apache License 2.0
+
