@@ -1,0 +1,29 @@
+[package]
+name = "zervram-scrub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zervram-hal   = { workspace = true }
+async-trait   = { workspace = true }
+chrono        = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex           = { workspace = true }
+rand          = { workspace = true }
+rand_chacha   = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+sha2          = { workspace = true }
+thiserror     = { workspace = true }
+tokio         = { workspace = true }
+tracing       = { workspace = true }
+uuid          = { workspace = true }
+zeroize       = { workspace = true }
+
+[dev-dependencies]
+zervram-hal   = { workspace = true, features = ["mock-gpu"] }
