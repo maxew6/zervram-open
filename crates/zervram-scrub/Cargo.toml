@@ -5,13 +5,24 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "zervram-scrub"
+path = "src/bin/zervram-scrub.rs"
+
 [lints]
 workspace = true
+
+[features]
+default = ["cuda-native", "rocm-native", "mock-gpu"]
+cuda-native = ["zervram-hal/cuda-native"]
+rocm-native = ["zervram-hal/rocm-native"]
+mock-gpu = ["zervram-hal/mock-gpu"]
 
 [dependencies]
 zervram-hal   = { workspace = true }
 async-trait   = { workspace = true }
 chrono        = { workspace = true }
+clap          = { workspace = true }
 ed25519-dalek = { workspace = true }
 hex           = { workspace = true }
 rand          = { workspace = true }

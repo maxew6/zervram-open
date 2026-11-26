@@ -1,11 +1,10 @@
 [workspace]
 resolver = "2"
-# 5-crate Zervram workspace:
-# zervram-hal, zervram-scrub, zervram-tpp, zervram-k8s, zervram-cli
+# Open-source vram-zero workspace: HAL + Cryptographic VRAM Sanitizer CLI
 members = ["crates/zervram-hal", "crates/zervram-scrub"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.82"
 license = "Apache-2.0"
@@ -31,7 +30,7 @@ zervram-scrub = { path = "crates/zervram-scrub" }
 zervram-tpp   = { path = "crates/zervram-tpp" }
 zervram-k8s   = { path = "crates/zervram-k8s" }
 
-# Core required crates (pure Rust + rustls/ed25519-dalek; zero OpenSSL or CUDA C headers)
+# Core dependencies (zero compile-time OpenSSL, CUDA, or ROCm C++ SDK headers)
 thiserror      = "2.0"
 tokio          = { version = "1.43", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "fs"] }
 axum           = { version = "0.8", features = ["ws", "json", "macros"] }
@@ -44,6 +43,7 @@ serde          = { version = "1.0", features = ["derive"] }
 serde_json     = "1.0"
 chrono         = { version = "0.4", features = ["serde"] }
 uuid           = { version = "1.12", features = ["v4", "v7", "serde"] }
+libloading     = "0.8"
 
 # Supporting pure-Rust crates
 async-trait        = "0.1"
@@ -57,4 +57,3 @@ tower-http         = { version = "0.6", features = ["trace", "cors", "limit"] }
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 zeroize            = { version = "1.8", features = ["derive"] }
-

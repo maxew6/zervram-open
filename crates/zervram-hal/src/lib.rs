@@ -1,12 +1,4 @@
-#![cfg_attr(
-    not(any(
-        feature = "cuda-native",
-        feature = "rocm-native",
-        feature = "tt-metalium-native",
-        feature = "furiosa-native"
-    )),
-    forbid(unsafe_code)
-)]
+#![deny(unsafe_code)]
 
 pub mod backend;
 pub mod catalog;
@@ -29,15 +21,16 @@ pub use model::{
     AcceleratorModel, AcceleratorVendor, BackendKind, DeviceDescriptor, DeviceState, HardwareSpec,
     MemoryRange, PageSample, ZeroizeReceipt, VRAM_PAGE_SIZE_BYTES,
 };
+pub use native::connect_physical_backend;
 
 #[cfg(feature = "mock-gpu")]
 pub use mock::{MockAcceleratorBackend, MockClusterConfig, MockDeviceRecord, SimulatedVramPool};
 
 /// Creates the default compiled-in [`AcceleratorDevice`] implementation.
 ///
-/// With the default `mock-gpu` feature enabled, initializes a deterministic heterogeneous
-/// [`MockAcceleratorBackend`] simulating NVIDIA H100 SXM, NVIDIA B200 Blackwell, AMD MI300X,
-/// Tenstorrent Blackhole p150, and FuriosaAI RNGD (8x SR-IOV slices) without any C/CUDA SDK.
+/// Prefers `MockAcceleratorBackend` when `mock-gpu` is enabled for unit tests and local
+/// development; production CLI callers should invoke [`connect_physical_backend`] and only fall
+/// back to [`MockAcceleratorBackend`] when explicitly authorized via `--allow-mock`.
 #[cfg(feature = "mock-gpu")]
 pub fn create_default_backend() -> Result<std::sync::Arc<dyn AcceleratorDevice>, HalError> {
     Ok(std::sync::Arc::new(MockAcceleratorBackend::new(
@@ -47,5 +40,5 @@ pub fn create_default_backend() -> Result<std::sync::Arc<dyn AcceleratorDevice>,
 
 #[cfg(not(feature = "mock-gpu"))]
 pub fn create_default_backend() -> Result<std::sync::Arc<dyn AcceleratorDevice>, HalError> {
-    native::connect_default_native_backend()
+    native::connect_physical_backend()
 }
