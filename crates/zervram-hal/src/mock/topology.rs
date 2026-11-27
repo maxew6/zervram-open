@@ -34,8 +34,10 @@ fn aligned_range(start_addr: u64, byte_len: u64) -> MemoryRange {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_whole_cards(
     devices: &mut BTreeMap<Uuid, MockDeviceRecord>,
+    next_ordinal: &mut u32,
     master_rng: &mut ChaCha8Rng,
     model: AcceleratorModel,
     count: usize,
@@ -46,12 +48,15 @@ fn insert_whole_cards(
     let spec = hardware_spec(model);
     for idx in 0..count {
         let device_uuid = next_deterministic_uuid(master_rng);
+        let device_ordinal = *next_ordinal;
+        *next_ordinal = next_ordinal.saturating_add(1);
         let node_ordinal = (idx / 8).saturating_add(1);
         let bus_offset = u32::try_from(idx % 200).unwrap_or(0);
         let pci_bus = pci_bus_base.saturating_add(bus_offset);
 
         let descriptor = DeviceDescriptor {
             device_uuid,
+            device_ordinal,
             node_name: format!("{node_prefix}-{node_ordinal:02}"),
             pci_bus_id: format!("0000:{pci_bus:02x}:00.0"),
             vendor: spec.vendor,
@@ -83,6 +88,7 @@ fn insert_whole_cards(
 
 fn insert_furiosa_rngd_sriov_cards(
     devices: &mut BTreeMap<Uuid, MockDeviceRecord>,
+    next_ordinal: &mut u32,
     master_rng: &mut ChaCha8Rng,
     physical_cards: usize,
     backing_pages: usize,
@@ -98,12 +104,15 @@ fn insert_furiosa_rngd_sriov_cards(
 
         for slice_idx in 0..parent_spec.sriov_slice_count {
             let device_uuid = next_deterministic_uuid(master_rng);
+            let device_ordinal = *next_ordinal;
+            *next_ordinal = next_ordinal.saturating_add(1);
             let slice_vram_offset =
                 u64::from(slice_idx).saturating_mul(slice_spec.vram_total_bytes);
             let start_addr = MOCK_VRAM_BASE_ADDR.saturating_add(slice_vram_offset);
 
             let descriptor = DeviceDescriptor {
                 device_uuid,
+                device_ordinal,
                 node_name: format!("npu-node-rngd-{node_ordinal:02}"),
                 pci_bus_id: format!("0000:{pci_bus:02x}:00.{slice_idx}"),
                 vendor: slice_spec.vendor,
@@ -134,16 +143,18 @@ fn insert_furiosa_rngd_sriov_cards(
     }
 }
 
-/// Builds a deterministic heterogeneous cluster spanning all 5 statutory hardware archetypes:
-/// NVIDIA H100 SXM, NVIDIA B200 Blackwell, AMD Instinct MI300X, Tenstorrent Blackhole p150,
-/// and FuriosaAI RNGD (expanded into 8x 1,024-TPP SR-IOV slices per physical card).
+/// Builds a deterministic heterogeneous software simulation cluster spanning NVIDIA H100 SXM,
+/// NVIDIA B200 Blackwell, AMD Instinct MI300X, Tenstorrent Blackhole p150, and FuriosaAI RNGD
+/// (expanded into 8x 1,024-TPP simulated SR-IOV slices per physical card).
 pub(crate) fn build_mock_cluster(config: &MockClusterConfig) -> BTreeMap<Uuid, MockDeviceRecord> {
     let mut master_rng = ChaCha8Rng::seed_from_u64(config.seed);
     let mut devices = BTreeMap::new();
+    let mut next_ordinal: u32 = 0;
     let backing_pages = config.backing_pages_per_device.max(1);
 
     insert_whole_cards(
         &mut devices,
+        &mut next_ordinal,
         &mut master_rng,
         AcceleratorModel::NvidiaH100Sxm,
         config.h100_count,
@@ -153,6 +164,7 @@ pub(crate) fn build_mock_cluster(config: &MockClusterConfig) -> BTreeMap<Uuid, M
     );
     insert_whole_cards(
         &mut devices,
+        &mut next_ordinal,
         &mut master_rng,
         AcceleratorModel::NvidiaB200Blackwell,
         config.b200_count,
@@ -162,6 +174,7 @@ pub(crate) fn build_mock_cluster(config: &MockClusterConfig) -> BTreeMap<Uuid, M
     );
     insert_whole_cards(
         &mut devices,
+        &mut next_ordinal,
         &mut master_rng,
         AcceleratorModel::AmdInstinctMi300x,
         config.mi300x_count,
@@ -171,6 +184,7 @@ pub(crate) fn build_mock_cluster(config: &MockClusterConfig) -> BTreeMap<Uuid, M
     );
     insert_whole_cards(
         &mut devices,
+        &mut next_ordinal,
         &mut master_rng,
         AcceleratorModel::TenstorrentBlackholeP150,
         config.blackhole_p150_count,
@@ -180,6 +194,7 @@ pub(crate) fn build_mock_cluster(config: &MockClusterConfig) -> BTreeMap<Uuid, M
     );
     insert_furiosa_rngd_sriov_cards(
         &mut devices,
+        &mut next_ordinal,
         &mut master_rng,
         config.furiosa_rngd_physical_cards,
         backing_pages,

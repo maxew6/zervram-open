@@ -32,6 +32,15 @@ pub enum HalError {
     #[error("unknown hardware model identifier: {raw}")]
     UnknownHardwareModel { raw: String },
 
+    #[error("refusing to scrub device {device_uuid}: active compute processes detected (PIDs: {active_pids:?}); pass --force to override")]
+    ActiveProcessesDetected {
+        device_uuid: Uuid,
+        active_pids: Vec<u32>,
+    },
+
+    #[error("hardware fault quarantine triggered on device {device_uuid}: {reason}")]
+    HardwareFaultQuarantine { device_uuid: Uuid, reason: String },
+
     #[error("native backend driver failure ({backend}): {message}")]
     NativeDriverFailure { backend: &'static str, message: String },
 }

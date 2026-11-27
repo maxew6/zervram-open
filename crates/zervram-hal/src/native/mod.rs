@@ -2,6 +2,8 @@
 pub mod cuda;
 #[cfg(feature = "furiosa-native")]
 pub mod furiosa;
+#[cfg(feature = "cuda-native")]
+pub(crate) mod nvml;
 #[cfg(feature = "rocm-native")]
 pub mod rocm;
 #[cfg(feature = "tt-metalium-native")]
@@ -22,6 +24,14 @@ pub enum NativeBackendPreference {
     Furiosa,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PhysicalBackendOptions {
+    /// When `true`, bypasses NVML active-process rejection (`--force`).
+    pub force_ignore_active_processes: bool,
+    /// Optional free-VRAM sweep percentage override (`1..=100`, default `99`).
+    pub sweep_free_vram_pct: Option<u8>,
+}
+
 /// Returns all native vendor backends compiled into the current binary via Cargo features.
 pub fn available_native_backends() -> Vec<BackendKind> {
     #[allow(unused_mut)]
@@ -37,33 +47,57 @@ pub fn available_native_backends() -> Vec<BackendKind> {
     backends
 }
 
+/// Probes real physical GPU drivers at runtime with default fail-closed options.
+pub fn connect_physical_backend() -> Result<Arc<dyn AcceleratorDevice>, HalError> {
+    connect_physical_backend_with_options(PhysicalBackendOptions::default())
+}
+
 /// Probes real physical GPU drivers at runtime (CUDA `libcuda.so.1`/`nvcuda.dll` first, then
 /// AMD ROCm `libamdhip64.so`/`amdhip64.dll`). Fails closed if no physical GPU driver or device
 /// is available; never silently falls back to `mock-gpu`.
-pub fn connect_physical_backend() -> Result<Arc<dyn AcceleratorDevice>, HalError> {
+pub fn connect_physical_backend_with_options(
+    options: PhysicalBackendOptions,
+) -> Result<Arc<dyn AcceleratorDevice>, HalError> {
+    let _ = options;
     #[allow(unused_mut)]
     let mut diagnostics: Vec<String> = Vec::new();
 
     #[cfg(feature = "cuda-native")]
-    match cuda::CudaAcceleratorBackend::connect(cuda::CudaDriverConfig::default()) {
-        Ok(backend) => {
-            if backend.device_count() > 0 {
-                return Ok(Arc::new(backend));
-            }
-            diagnostics.push("cuda-native: driver loaded but 0 CUDA GPUs reported".to_string());
+    {
+        let mut cfg = cuda::CudaDriverConfig {
+            force_ignore_active_processes: options.force_ignore_active_processes,
+            ..cuda::CudaDriverConfig::default()
+        };
+        if let Some(pct) = options.sweep_free_vram_pct {
+            cfg.sweep_free_vram_pct = pct.clamp(1, 100);
         }
-        Err(err) => diagnostics.push(format!("cuda-native: {err}")),
+        match cuda::CudaAcceleratorBackend::connect(cfg) {
+            Ok(backend) => {
+                if backend.device_count() > 0 {
+                    return Ok(Arc::new(backend));
+                }
+                diagnostics.push("cuda-native: driver loaded but 0 CUDA GPUs reported".to_string());
+            }
+            Err(err) => diagnostics.push(format!("cuda-native: {err}")),
+        }
     }
 
     #[cfg(feature = "rocm-native")]
-    match rocm::RocmAcceleratorBackend::connect(rocm::RocmDriverConfig::default()) {
-        Ok(backend) => {
-            if backend.device_count() > 0 {
-                return Ok(Arc::new(backend));
-            }
-            diagnostics.push("rocm-native: runtime loaded but 0 HIP GPUs reported".to_string());
+    {
+        let mut cfg = rocm::RocmDriverConfig::default();
+        if let Some(pct) = options.sweep_free_vram_pct {
+            cfg.sweep_free_vram_pct = pct.clamp(1, 100);
         }
-        Err(err) => diagnostics.push(format!("rocm-native: {err}")),
+        match rocm::RocmAcceleratorBackend::connect(cfg) {
+            Ok(backend) => {
+                if backend.device_count() > 0 {
+                    return Ok(Arc::new(backend));
+                }
+                diagnostics
+                    .push("rocm-native: runtime loaded but 0 HIP GPUs reported".to_string());
+            }
+            Err(err) => diagnostics.push(format!("rocm-native: {err}")),
+        }
     }
 
     if diagnostics.is_empty() {
@@ -79,26 +113,31 @@ pub fn connect_physical_backend() -> Result<Arc<dyn AcceleratorDevice>, HalError
     })
 }
 
-/// Safe shared helpers for real physical VRAM sweeping and 4KB page verification planning.
+/// Safe shared helpers for physical VRAM sweeping, CSPRNG page sampling, and SKU classification.
 #[cfg(any(feature = "cuda-native", feature = "rocm-native", test))]
 pub(crate) mod sweep_plan {
     use std::collections::BTreeSet;
+
+    use rand::{Rng, SeedableRng};
+    use rand_chacha::ChaCha20Rng;
 
     use crate::catalog::hardware_spec;
     use crate::error::HalError;
     use crate::model::{AcceleratorModel, AcceleratorVendor, VRAM_PAGE_SIZE_BYTES};
 
-    pub const DEFAULT_SWEEP_RATIO_PCT: u8 = 90;
-    pub const DEFAULT_VERIFY_SAMPLE_PAGES: usize = 64;
+    pub const DEFAULT_SWEEP_RATIO_PCT: u8 = 99;
+    pub const DEFAULT_CANARY_SAMPLE_PAGES: usize = 64;
+    pub const DEFAULT_FALLBACK_SAMPLE_PAGES: usize = 256;
 
-    /// Ordered descending chunk sizes (256 MiB -> 64 MiB -> 16 MiB -> 4 MiB -> 1 MiB -> 4 KiB)
-    /// used to safely cover ~90% of free physical VRAM even under allocator fragmentation.
+    /// Ordered descending chunk sizes (`256 MiB -> 64 MiB -> 16 MiB -> 4 MiB -> 1 MiB -> 64 KiB -> 4 KiB`)
+    /// used to drain free physical VRAM up to OOM even under allocator fragmentation.
     pub const SWEEP_CHUNK_LADDER_BYTES: &[usize] = &[
         256 * 1024 * 1024,
         64 * 1024 * 1024,
         16 * 1024 * 1024,
         4 * 1024 * 1024,
         1024 * 1024,
+        64 * 1024,
         VRAM_PAGE_SIZE_BYTES as usize,
     ];
 
@@ -112,7 +151,7 @@ pub(crate) mod sweep_plan {
         free_bytes: usize,
         sweep_ratio_pct: u8,
     ) -> Result<usize, HalError> {
-        let pct = usize::from(sweep_ratio_pct.clamp(1, 98));
+        let pct = usize::from(sweep_ratio_pct.clamp(1, 100));
         let raw = free_bytes
             .checked_div(100)
             .map(|q| q.saturating_mul(pct))
@@ -130,9 +169,10 @@ pub(crate) mod sweep_plan {
         Ok(aligned)
     }
 
-    /// Selects up to `max_pages` 4KB-aligned `(chunk_index, byte_offset_within_chunk)` coordinates
-    /// spanning boundary pages and evenly stratified interior pages across all live swept chunks.
-    pub fn select_chunk_verification_targets(
+    /// Selects up to `max_pages` 4 KiB-aligned `(chunk_index, byte_offset_within_chunk)` coordinates
+    /// covering boundary pages (first & last) plus CSPRNG-random (`ChaCha20Rng::from_entropy()`)
+    /// interior pages across all live swept chunks.
+    pub fn select_csprng_chunk_verification_targets(
         chunk_lengths: &[usize],
         max_pages: usize,
     ) -> Vec<(usize, usize)> {
@@ -150,16 +190,33 @@ pub(crate) mod sweep_plan {
 
         let sample_count = max_pages.min(total_pages);
         let mut global_indices = BTreeSet::new();
-        if sample_count == 1 {
+
+        if sample_count == total_pages {
+            for idx in 0..total_pages {
+                global_indices.insert(idx);
+            }
+        } else if sample_count == 1 {
             global_indices.insert(0);
         } else {
-            let max_idx = total_pages.saturating_sub(1);
-            let denom = sample_count.saturating_sub(1);
-            for step in 0..sample_count {
-                let idx = (step as u128)
-                    .saturating_mul(max_idx as u128)
-                    / (denom as u128);
-                global_indices.insert(usize::try_from(idx).unwrap_or(0));
+            global_indices.insert(0);
+            global_indices.insert(total_pages.saturating_sub(1));
+
+            let mut rng = ChaCha20Rng::from_entropy();
+            let max_attempts = sample_count.saturating_mul(8).max(32);
+            for _ in 0..max_attempts {
+                if global_indices.len() >= sample_count {
+                    break;
+                }
+                let candidate = rng.gen_range(1..total_pages.saturating_sub(1));
+                global_indices.insert(candidate);
+            }
+            if global_indices.len() < sample_count {
+                for fallback in 1..total_pages.saturating_sub(1) {
+                    if global_indices.len() >= sample_count {
+                        break;
+                    }
+                    global_indices.insert(fallback);
+                }
             }
         }
 
@@ -177,28 +234,74 @@ pub(crate) mod sweep_plan {
         targets
     }
 
+    fn contains_token(haystack: &str, token: &str) -> bool {
+        haystack
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|part| part == token)
+    }
+
+    /// Accurately classifies real datacenter GPU names into catalog SKUs; returns
+    /// `(AcceleratorModel::Unknown, None)` for unrecognized models rather than misclassifying.
     pub fn infer_model_from_name(
         name: &str,
         vendor: AcceleratorVendor,
-    ) -> (AcceleratorModel, u64) {
+    ) -> (AcceleratorModel, Option<u64>) {
         let lower = name.to_ascii_lowercase();
         let model = match vendor {
             AcceleratorVendor::Nvidia => {
-                if lower.contains("b200") || lower.contains("blackwell") {
+                if contains_token(&lower, "b200") || lower.contains("blackwell") {
                     AcceleratorModel::NvidiaB200Blackwell
-                } else {
+                } else if contains_token(&lower, "h200") {
+                    AcceleratorModel::NvidiaH200Sxm
+                } else if contains_token(&lower, "h100") {
                     AcceleratorModel::NvidiaH100Sxm
+                } else if contains_token(&lower, "a100") {
+                    AcceleratorModel::NvidiaA100
+                } else if contains_token(&lower, "l40s") {
+                    AcceleratorModel::NvidiaL40s
+                } else if contains_token(&lower, "l4") {
+                    AcceleratorModel::NvidiaL4
+                } else if contains_token(&lower, "t4") {
+                    AcceleratorModel::NvidiaT4
+                } else {
+                    AcceleratorModel::Unknown
                 }
             }
-            AcceleratorVendor::Amd => AcceleratorModel::AmdInstinctMi300x,
-            AcceleratorVendor::Tenstorrent => AcceleratorModel::TenstorrentBlackholeP150,
-            AcceleratorVendor::FuriosaAi => AcceleratorModel::FuriosaRngd,
+            AcceleratorVendor::Amd => {
+                if contains_token(&lower, "mi350x") {
+                    AcceleratorModel::AmdInstinctMi350x
+                } else if contains_token(&lower, "mi325x") {
+                    AcceleratorModel::AmdInstinctMi325x
+                } else if contains_token(&lower, "mi300x") {
+                    AcceleratorModel::AmdInstinctMi300x
+                } else {
+                    AcceleratorModel::Unknown
+                }
+            }
+            AcceleratorVendor::Tenstorrent => {
+                if lower.contains("blackhole") || contains_token(&lower, "p150") {
+                    AcceleratorModel::TenstorrentBlackholeP150
+                } else {
+                    AcceleratorModel::Unknown
+                }
+            }
+            AcceleratorVendor::FuriosaAi => {
+                if contains_token(&lower, "rngd") {
+                    AcceleratorModel::FuriosaRngd
+                } else {
+                    AcceleratorModel::Unknown
+                }
+            }
         };
         let tpp = hardware_spec(model).tpp_per_unit;
         (model, tpp)
     }
 
-    pub fn deterministic_device_uuid(vendor_tag: u8, ordinal: usize, pci_bus_id: &str) -> uuid::Uuid {
+    pub fn deterministic_device_uuid(
+        vendor_tag: u8,
+        ordinal: usize,
+        pci_bus_id: &str,
+    ) -> uuid::Uuid {
         let mut bytes = [0u8; 16];
         if let Some(slot) = bytes.first_mut() {
             *slot = 0x5A; // 'Z'
@@ -263,7 +366,7 @@ pub(crate) mod common {
             HalError::NativeDriverFailure {
                 backend: self.backend_name,
                 message: format!(
-                    "native runtime session not bound for `{symbol}` via {}",
+                    "experimental-stub: vendor FFI bindings for `{symbol}` are not yet implemented (probed {})",
                     self.driver_path
                 ),
             }
@@ -346,7 +449,7 @@ pub(crate) mod common {
         Err(HalError::NativeDriverFailure {
             backend,
             message: format!(
-                "vendor runtime library not found on host (probed: {}); pass --allow-mock on systems without datacenter accelerators",
+                "experimental-stub vendor runtime library not found on host (probed: {}); pass --allow-mock for software simulation",
                 default_candidates.join(", ")
             ),
         })
@@ -360,28 +463,26 @@ mod tests {
     use crate::model::{AcceleratorModel, AcceleratorVendor, VRAM_PAGE_SIZE_BYTES};
 
     #[test]
-    fn sweep_target_aligns_90_percent_to_4kb_boundary() -> Result<(), HalError> {
+    fn sweep_target_aligns_99_and_100_percent_to_4kb_boundary() -> Result<(), HalError> {
         let free_80g: usize = 80 * 1024 * 1024 * 1024;
-        let target = compute_sweep_target_bytes("cuda-native", free_80g, 90)?;
-        assert_eq!(target % (VRAM_PAGE_SIZE_BYTES as usize), 0);
-        assert_eq!(target, 72 * 1024 * 1024 * 1024);
+        let target_99 = compute_sweep_target_bytes("cuda-native", free_80g, 99)?;
+        assert_eq!(target_99 % (VRAM_PAGE_SIZE_BYTES as usize), 0);
+        assert!(target_99 > 79 * 1024 * 1024 * 1024);
 
-        let odd_free: usize = 100_003;
-        let odd_target = compute_sweep_target_bytes("cuda-native", odd_free, 90)?;
-        assert_eq!(odd_target % 4096, 0);
-        assert!(odd_target <= 90_002);
+        let target_100 = compute_sweep_target_bytes("cuda-native", free_80g, 100)?;
+        assert_eq!(target_100, free_80g);
 
         assert!(matches!(
-            compute_sweep_target_bytes("cuda-native", 2048, 90),
+            compute_sweep_target_bytes("cuda-native", 2048, 99),
             Err(HalError::NativeDriverFailure { .. })
         ));
         Ok(())
     }
 
     #[test]
-    fn stratified_chunk_sampling_covers_first_and_last_4kb_pages() {
+    fn csprng_chunk_sampling_covers_boundaries_and_is_4kb_aligned() {
         let chunks = [16 * 1024 * 1024, 8 * 1024 * 1024, 4 * 1024 * 1024];
-        let targets = select_chunk_verification_targets(&chunks, 64);
+        let targets = select_csprng_chunk_verification_targets(&chunks, 64);
         assert_eq!(targets.len(), 64);
         assert_eq!(targets.first().copied(), Some((0, 0)));
         assert_eq!(
@@ -394,21 +495,67 @@ mod tests {
     }
 
     #[test]
-    fn infers_hardware_model_from_driver_device_names() {
-        let (b200, b200_tpp) =
-            infer_model_from_name("NVIDIA B200 SXM", AcceleratorVendor::Nvidia);
-        assert_eq!(b200, AcceleratorModel::NvidiaB200Blackwell);
-        assert_eq!(b200_tpp, 36_000);
+    fn infers_all_real_nvidia_and_amd_skus_and_unknown_fallback() {
+        assert_eq!(
+            infer_model_from_name("Tesla T4", AcceleratorVendor::Nvidia),
+            (AcceleratorModel::NvidiaT4, Some(2_080))
+        );
+        assert_eq!(
+            infer_model_from_name("NVIDIA L4", AcceleratorVendor::Nvidia),
+            (AcceleratorModel::NvidiaL4, Some(3_872))
+        );
+        assert_eq!(
+            infer_model_from_name("NVIDIA L40S", AcceleratorVendor::Nvidia),
+            (AcceleratorModel::NvidiaL40s, Some(11_728))
+        );
+        assert_eq!(
+            infer_model_from_name("NVIDIA A100-SXM4-80GB", AcceleratorVendor::Nvidia),
+            (AcceleratorModel::NvidiaA100, Some(9_984))
+        );
+        assert_eq!(
+            infer_model_from_name("NVIDIA H100 80GB HBM3", AcceleratorVendor::Nvidia),
+            (AcceleratorModel::NvidiaH100Sxm, Some(15_832))
+        );
+        assert_eq!(
+            infer_model_from_name("NVIDIA H200", AcceleratorVendor::Nvidia),
+            (AcceleratorModel::NvidiaH200Sxm, Some(15_832))
+        );
+        assert_eq!(
+            infer_model_from_name("NVIDIA B200 SXM", AcceleratorVendor::Nvidia),
+            (AcceleratorModel::NvidiaB200Blackwell, Some(36_000))
+        );
+        assert_eq!(
+            infer_model_from_name("NVIDIA GeForce RTX 4090", AcceleratorVendor::Nvidia),
+            (AcceleratorModel::Unknown, None)
+        );
+        assert_eq!(
+            infer_model_from_name("AMD Instinct MI300X", AcceleratorVendor::Amd),
+            (AcceleratorModel::AmdInstinctMi300x, Some(20_880))
+        );
+        assert_eq!(
+            infer_model_from_name("AMD Instinct MI325X", AcceleratorVendor::Amd),
+            (AcceleratorModel::AmdInstinctMi325x, Some(20_880))
+        );
+        assert_eq!(
+            infer_model_from_name("AMD Instinct MI350X", AcceleratorVendor::Amd),
+            (AcceleratorModel::AmdInstinctMi350x, Some(36_800))
+        );
+        assert_eq!(
+            infer_model_from_name("AMD Radeon RX 7900 XTX", AcceleratorVendor::Amd),
+            (AcceleratorModel::Unknown, None)
+        );
+    }
 
-        let (h100, h100_tpp) =
-            infer_model_from_name("NVIDIA H100 80GB HBM3", AcceleratorVendor::Nvidia);
-        assert_eq!(h100, AcceleratorModel::NvidiaH100Sxm);
-        assert_eq!(h100_tpp, 15_832);
-
-        let (mi300x, mi300x_tpp) =
-            infer_model_from_name("AMD Instinct MI300X", AcceleratorVendor::Amd);
-        assert_eq!(mi300x, AcceleratorModel::AmdInstinctMi300x);
-        assert_eq!(mi300x_tpp, 20_880);
+    #[cfg(feature = "cuda-native")]
+    #[test]
+    fn ptx_kernel_is_nul_terminated_with_valid_isa_7_sm_50_header() {
+        let ptx = super::cuda::PTX_VERIFY_ZERO_KERNEL;
+        assert_eq!(ptx.last().copied(), Some(0u8));
+        let text = String::from_utf8_lossy(ptx);
+        assert!(text.contains(".version 7.0"));
+        assert!(text.contains(".target sm_50"));
+        assert!(text.contains(".address_size 64"));
+        assert!(text.contains(".visible .entry zervram_verify_zero_u64"));
     }
 
     #[cfg(feature = "cuda-native")]

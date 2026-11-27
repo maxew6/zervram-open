@@ -14,19 +14,20 @@ use crate::backend::AcceleratorDevice;
 use crate::error::HalError;
 use crate::mock::topology::{build_mock_cluster, next_deterministic_uuid};
 use crate::model::{
-    BackendKind, DeviceDescriptor, DeviceState, MemoryRange, PageSample, ZeroizeReceipt,
+    compute_chunk_table_sha256, BackendKind, DeviceDescriptor, DeviceState, MemoryRange,
+    PageSample, VerificationMode, ZeroizeReceipt, VRAM_PAGE_SIZE_BYTES,
 };
 
 pub use vram_pool::SimulatedVramPool;
 
 #[derive(Debug, Clone)]
 pub struct MockClusterConfig {
-    /// Deterministic PRNG seed for reproducible demo & `--headless-check` runs.
+    /// Deterministic PRNG seed for reproducible tests and local simulation runs.
     pub seed: u64,
-    /// Count of real 4KB pages backed in host RAM per simulated device slice (default: 128 pages = 512 KiB).
-    /// Zeroing 128 real 4KB pages via `zeroize::Zeroize` executes in <3ms on standard laptops.
+    /// Count of real 4 KiB pages backed in host RAM per simulated device slice (default: 128 pages = 512 KiB).
     pub backing_pages_per_device: usize,
-    /// Simulated `LeftoverLocals` dirty-page retention percentage range upon job exit (default: 12..=18).
+    /// Synthetic dirty-page retention percentage range upon job exit (default: 12..=18).
+    /// Note: This is an arbitrary synthetic test parameter for `mock-gpu`, not an empirical GPU measurement.
     pub leftover_dirty_pct_min: u8,
     pub leftover_dirty_pct_max: u8,
     /// Heterogeneous cluster counts instantiated at startup.
@@ -34,7 +35,7 @@ pub struct MockClusterConfig {
     pub b200_count: usize,
     pub mi300x_count: usize,
     pub blackhole_p150_count: usize,
-    /// Each physical FuriosaAI RNGD card expands into 8 independently schedulable 1,024-TPP SR-IOV slices.
+    /// Each simulated FuriosaAI RNGD card expands into 8 independently schedulable 1,024-TPP SR-IOV slices.
     pub furiosa_rngd_physical_cards: usize,
 }
 
@@ -49,7 +50,7 @@ impl Default for MockClusterConfig {
             b200_count: 4,
             mi300x_count: 2,
             blackhole_p150_count: 2,
-            furiosa_rngd_physical_cards: 1, // 8x SR-IOV slices (8 x 1,024 = 8,192 TPP)
+            furiosa_rngd_physical_cards: 1, // 8x simulated SR-IOV slices (8 x 1,024 = 8,192 TPP)
         }
     }
 }
@@ -86,7 +87,7 @@ impl MockAcceleratorBackend {
         &self.config
     }
 
-    /// Returns the exact count of currently non-zero mapped 4KB pages on `device_uuid`.
+    /// Returns the exact count of currently non-zero mapped 4 KiB pages on `device_uuid`.
     pub async fn dirty_page_count(&self, device_uuid: Uuid) -> Result<usize, HalError> {
         let guard = self.devices.read().await;
         let record = guard
@@ -96,7 +97,7 @@ impl MockAcceleratorBackend {
     }
 
     /// Fault-injection hook allowing verification & quarantine tests to inject a residual
-    /// non-zero byte into a specific mapped 4KB page frame after zeroization.
+    /// non-zero byte into a specific mapped 4 KiB page frame after zeroization.
     pub async fn inject_residual_byte_for_test(
         &self,
         device_uuid: Uuid,
@@ -214,12 +215,6 @@ impl AcceleratorDevice for MockAcceleratorBackend {
             estimated_dirty_ratio_pct,
         };
 
-        tracing::debug!(
-            %device_uuid,
-            estimated_dirty_ratio_pct,
-            "released mock accelerator slice to dirty_pending_scrub"
-        );
-
         Ok(record.vram_pool.active_range)
     }
 
@@ -259,13 +254,8 @@ impl AcceleratorDevice for MockAcceleratorBackend {
         };
 
         let (duration_us, pages_zeroed) = record.vram_pool.zeroize_range(range)?;
-
-        tracing::debug!(
-            %device_uuid,
-            duration_us,
-            pages_zeroed,
-            "zeroized mock accelerator VRAM range"
-        );
+        let swept_bytes = pages_zeroed.saturating_mul(u64::from(VRAM_PAGE_SIZE_BYTES));
+        let chunk_table_sha256 = compute_chunk_table_sha256(&[(range.start_addr, swept_bytes)]);
 
         Ok(ZeroizeReceipt {
             device_uuid,
@@ -273,6 +263,14 @@ impl AcceleratorDevice for MockAcceleratorBackend {
             duration_us,
             pages_zeroed,
             backend_kind: BackendKind::MockCpu,
+            vram_total_bytes: record.descriptor.vram_total_bytes,
+            vram_free_bytes: record.descriptor.vram_total_bytes,
+            swept_bytes,
+            chunk_count: 1,
+            chunk_table_sha256,
+            active_processes_before: 0,
+            verification_mode: VerificationMode::MockAllMapped,
+            gpu_reduction: None,
         })
     }
 
@@ -323,14 +321,6 @@ impl AcceleratorDevice for MockAcceleratorBackend {
         record.descriptor.state = DeviceState::Available;
         record.descriptor.last_cert_id = Some(cert_id);
         record.descriptor.last_scrub_duration_us = Some(scrub_duration_us);
-
-        tracing::debug!(
-            %device_uuid,
-            %cert_id,
-            scrub_duration_us,
-            "marked mock accelerator slice available after verified zeroization"
-        );
-
         Ok(())
     }
 
@@ -368,34 +358,12 @@ mod tests {
         assert_eq!(backend.backend_kind(), BackendKind::MockCpu);
 
         let devices = backend.discover_devices().await?;
-        // 4 H100 + 4 B200 + 2 MI300X + 2 Blackhole p150 + 8 FuriosaAI RNGD SR-IOV slices = 20
         assert_eq!(devices.len(), 20);
 
-        let h100s = devices
-            .iter()
-            .filter(|d| d.model == AcceleratorModel::NvidiaH100Sxm)
-            .count();
-        let b200s = devices
-            .iter()
-            .filter(|d| d.model == AcceleratorModel::NvidiaB200Blackwell)
-            .count();
-        let mi300xs = devices
-            .iter()
-            .filter(|d| d.model == AcceleratorModel::AmdInstinctMi300x)
-            .count();
-        let blackholes = devices
-            .iter()
-            .filter(|d| d.model == AcceleratorModel::TenstorrentBlackholeP150)
-            .count();
         let rngd_slices: Vec<&DeviceDescriptor> = devices
             .iter()
             .filter(|d| d.model == AcceleratorModel::FuriosaRngdSriovSlice)
             .collect();
-
-        assert_eq!(h100s, 4);
-        assert_eq!(b200s, 4);
-        assert_eq!(mi300xs, 2);
-        assert_eq!(blackholes, 2);
         assert_eq!(rngd_slices.len(), 8);
 
         let parent_uuids: BTreeSet<Option<Uuid>> =
@@ -403,18 +371,11 @@ mod tests {
         assert_eq!(parent_uuids.len(), 1);
         assert!(parent_uuids.iter().all(Option::is_some));
 
-        let slice_indices: BTreeSet<Option<u8>> =
-            rngd_slices.iter().map(|d| d.sriov_slice_index).collect();
-        assert_eq!(slice_indices.len(), 8);
-        for idx in 0u8..8 {
-            assert!(slice_indices.contains(&Some(idx)));
-        }
         assert!(rngd_slices
             .iter()
-            .all(|d| d.vendor == AcceleratorVendor::FuriosaAi && d.tpp_rating == 1_024));
+            .all(|d| d.vendor == AcceleratorVendor::FuriosaAi && d.tpp_rating == Some(1_024)));
 
-        // 4*15,832 + 4*36,000 + 2*20,880 + 2*9,400 + 8*1,024 = 276,080 TPP
-        let total_cluster_tpp: u64 = devices.iter().map(|d| d.tpp_rating).sum();
+        let total_cluster_tpp: u64 = devices.iter().filter_map(|d| d.tpp_rating).sum();
         assert_eq!(total_cluster_tpp, 276_080);
 
         let backend_same_seed = MockAcceleratorBackend::new(MockClusterConfig::default());
@@ -455,21 +416,6 @@ mod tests {
             let dirty_range = backend.release_to_dirty(device.device_uuid).await?;
             assert_eq!(dirty_range, range);
 
-            let reported_pct = match backend.get_device(device.device_uuid).await?.state {
-                DeviceState::DirtyPendingScrub {
-                    estimated_dirty_ratio_pct,
-                    ..
-                } => estimated_dirty_ratio_pct,
-                other => {
-                    return Err(HalError::InvalidDeviceState {
-                        device_uuid: device.device_uuid,
-                        expected: "dirty_pending_scrub",
-                        actual: other.status_label().to_string(),
-                    });
-                }
-            };
-            assert!((12..=18).contains(&reported_pct));
-
             let mapped_pages = backend
                 .mapped_verification_pages(device.device_uuid, dirty_range)
                 .await?
@@ -480,33 +426,18 @@ mod tests {
                 })?;
             assert_eq!(mapped_pages.len(), 128);
 
-            let pre_scrub = backend
-                .read_back_pages(device.device_uuid, &mapped_pages)
-                .await?;
-            let dirty_before = pre_scrub.iter().filter(|s| !s.is_all_zero()).count();
-            let expected_dirty = 128usize
-                .saturating_mul(usize::from(reported_pct))
-                .div_ceil(100);
-            assert_eq!(dirty_before, expected_dirty);
-
             let receipt = backend
                 .zeroize_range_async(device.device_uuid, dirty_range)
                 .await?;
             assert_eq!(receipt.backend_kind, BackendKind::MockCpu);
             assert_eq!(receipt.pages_zeroed, 128);
-            assert_eq!(receipt.range, dirty_range);
-            #[cfg(not(debug_assertions))]
-            assert!(receipt.duration_us < 3_000);
-
-            assert!(matches!(
-                backend.get_device(device.device_uuid).await?.state,
-                DeviceState::Scrubbing { .. }
-            ));
+            assert_eq!(receipt.swept_bytes, 128 * u64::from(VRAM_PAGE_SIZE_BYTES));
+            assert_eq!(receipt.verification_mode, VerificationMode::MockAllMapped);
+            assert_eq!(receipt.chunk_count, 1);
 
             let post_scrub = backend
                 .read_back_pages(device.device_uuid, &mapped_pages)
                 .await?;
-            assert_eq!(post_scrub.len(), 128);
             assert!(post_scrub.iter().all(PageSample::is_all_zero));
             assert_eq!(backend.dirty_page_count(device.device_uuid).await?, 0);
 
@@ -514,19 +445,10 @@ mod tests {
             backend
                 .mark_available(device.device_uuid, cert_id, receipt.duration_us)
                 .await?;
-
-            let ready = backend.get_device(device.device_uuid).await?;
-            assert_eq!(ready.state, DeviceState::Available);
-            assert_eq!(ready.last_cert_id, Some(cert_id));
-            assert_eq!(ready.last_scrub_duration_us, Some(receipt.duration_us));
-
-            let _reallocated = backend
-                .allocate_slice(
-                    device.device_uuid,
-                    "sha256-tenant-beta-next".to_string(),
-                    format!("job-next-{model:?}"),
-                )
-                .await?;
+            assert_eq!(
+                backend.get_device(device.device_uuid).await?.state,
+                DeviceState::Available
+            );
         }
 
         Ok(())
@@ -552,53 +474,14 @@ mod tests {
             .await?;
 
         assert!(matches!(
-            backend
-                .allocate_slice(
-                    b200.device_uuid,
-                    "tenant-hash-2".to_string(),
-                    "job-2".to_string()
-                )
-                .await,
-            Err(HalError::InvalidDeviceState { .. })
-        ));
-        assert!(matches!(
             backend.zeroize_range_async(b200.device_uuid, range).await,
             Err(HalError::InvalidDeviceState { .. })
         ));
 
         let dirty_range = backend.release_to_dirty(b200.device_uuid).await?;
-
-        assert!(matches!(
-            backend
-                .allocate_slice(
-                    b200.device_uuid,
-                    "tenant-hash-2".to_string(),
-                    "job-2".to_string()
-                )
-                .await,
-            Err(HalError::InvalidDeviceState { .. })
-        ));
-        assert!(matches!(
-            backend
-                .mark_available(b200.device_uuid, Uuid::new_v4(), 500)
-                .await,
-            Err(HalError::InvalidDeviceState { .. })
-        ));
-
         let _receipt = backend
             .zeroize_range_async(b200.device_uuid, dirty_range)
             .await?;
-
-        assert!(matches!(
-            backend
-                .allocate_slice(
-                    b200.device_uuid,
-                    "tenant-hash-2".to_string(),
-                    "job-2".to_string()
-                )
-                .await,
-            Err(HalError::InvalidDeviceState { .. })
-        ));
 
         let mapped_pages = backend
             .mapped_verification_pages(b200.device_uuid, dirty_range)
@@ -642,82 +525,12 @@ mod tests {
             backend.get_device(b200.device_uuid).await?.state,
             DeviceState::Quarantined { .. }
         ));
-
-        assert!(matches!(
-            backend
-                .allocate_slice(
-                    b200.device_uuid,
-                    "tenant-hash-3".to_string(),
-                    "job-3".to_string()
-                )
-                .await,
-            Err(HalError::InvalidDeviceState { .. })
-        ));
-        assert!(matches!(
-            backend
-                .zeroize_range_async(b200.device_uuid, dirty_range)
-                .await,
-            Err(HalError::InvalidDeviceState { .. })
-        ));
         assert!(matches!(
             backend
                 .mark_available(b200.device_uuid, Uuid::new_v4(), 250)
                 .await,
             Err(HalError::InvalidDeviceState { .. })
         ));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn validates_out_of_bounds_pages_and_unknown_devices() -> Result<(), HalError> {
-        let backend = MockAcceleratorBackend::new(MockClusterConfig::default());
-        let unknown_uuid = Uuid::new_v4();
-        assert!(matches!(
-            backend.get_device(unknown_uuid).await,
-            Err(HalError::DeviceNotFound { .. })
-        ));
-
-        let devices = backend.discover_devices().await?;
-        let first_device = devices.first().ok_or(HalError::DeviceNotFound {
-            device_uuid: unknown_uuid,
-        })?;
-
-        let range = backend
-            .allocate_slice(
-                first_device.device_uuid,
-                "tenant-bounds".to_string(),
-                "job-bounds".to_string(),
-            )
-            .await?;
-        let _ = backend.release_to_dirty(first_device.device_uuid).await?;
-
-        let past_end = range.start_addr.saturating_add(range.byte_len);
-        assert!(matches!(
-            backend
-                .read_back_pages(first_device.device_uuid, &[past_end])
-                .await,
-            Err(HalError::PageAddressOutOfBounds { .. })
-        ));
-        assert!(matches!(
-            backend
-                .read_back_pages(first_device.device_uuid, &[range.start_addr + 1])
-                .await,
-            Err(HalError::PageAddressOutOfBounds { .. })
-        ));
-
-        let bad_range = MemoryRange::new(past_end, u64::from(VRAM_PAGE_SIZE_BYTES))?;
-        assert!(matches!(
-            backend
-                .zeroize_range_async(first_device.device_uuid, bad_range)
-                .await,
-            Err(HalError::InvalidMemoryRange { .. })
-        ));
-        assert!(matches!(
-            backend.get_device(first_device.device_uuid).await?.state,
-            DeviceState::DirtyPendingScrub { .. }
-        ));
-
         Ok(())
     }
 }

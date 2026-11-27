@@ -16,13 +16,14 @@ use uuid::Uuid;
 use crate::backend::AcceleratorDevice;
 use crate::error::HalError;
 use crate::model::{
-    AcceleratorVendor, BackendKind, DeviceDescriptor, DeviceState, MemoryRange, PageSample,
-    ZeroizeReceipt, VRAM_PAGE_SIZE_BYTES,
+    compute_chunk_table_sha256, AcceleratorVendor, BackendKind, DeviceDescriptor, DeviceState,
+    MemoryRange, PageSample, VerificationMode, ZeroizeReceipt, READBACK_POISON_BYTE,
+    VRAM_PAGE_SIZE_BYTES,
 };
 use crate::native::sweep_plan::{
     align_down_4k, compute_sweep_target_bytes, deterministic_device_uuid, infer_model_from_name,
-    select_chunk_verification_targets, DEFAULT_SWEEP_RATIO_PCT, DEFAULT_VERIFY_SAMPLE_PAGES,
-    SWEEP_CHUNK_LADDER_BYTES,
+    select_csprng_chunk_verification_targets, DEFAULT_FALLBACK_SAMPLE_PAGES,
+    DEFAULT_SWEEP_RATIO_PCT, SWEEP_CHUNK_LADDER_BYTES,
 };
 
 const ROCM_BACKEND_NAME: &str = "rocm-native";
@@ -50,6 +51,7 @@ type HipStream = *mut c_void;
 
 type FnHipGetDeviceCount = unsafe extern "system" fn(*mut i32) -> HipError;
 type FnHipSetDevice = unsafe extern "system" fn(i32) -> HipError;
+type FnHipDeviceGetName = unsafe extern "system" fn(*mut c_char, i32, i32) -> HipError;
 type FnHipDeviceGetPciBusId = unsafe extern "system" fn(*mut c_char, i32, i32) -> HipError;
 type FnHipMemGetInfo = unsafe extern "system" fn(*mut usize, *mut usize) -> HipError;
 type FnHipMalloc = unsafe extern "system" fn(*mut *mut c_void, usize) -> HipError;
@@ -62,7 +64,9 @@ type FnHipFree = unsafe extern "system" fn(*mut c_void) -> HipError;
 #[derive(Debug, Clone)]
 pub struct RocmDriverConfig {
     pub driver_library_path: Option<String>,
+    /// Percentage of free physical VRAM to sweep (default: 99%).
     pub sweep_free_vram_pct: u8,
+    /// Number of CSPRNG-random 4 KiB pages to read back into `0xAA`-poisoned buffers (default: 256).
     pub verify_sample_pages: usize,
 }
 
@@ -71,7 +75,7 @@ impl Default for RocmDriverConfig {
         Self {
             driver_library_path: None,
             sweep_free_vram_pct: DEFAULT_SWEEP_RATIO_PCT,
-            verify_sample_pages: DEFAULT_VERIFY_SAMPLE_PAGES,
+            verify_sample_pages: DEFAULT_FALLBACK_SAMPLE_PAGES,
         }
     }
 }
@@ -80,6 +84,7 @@ struct HipDriver {
     driver_path: String,
     hip_get_device_count: FnHipGetDeviceCount,
     hip_set_device: FnHipSetDevice,
+    hip_device_get_name: Option<FnHipDeviceGetName>,
     hip_device_get_pci_bus_id: Option<FnHipDeviceGetPciBusId>,
     hip_mem_get_info: FnHipMemGetInfo,
     hip_malloc: FnHipMalloc,
@@ -96,6 +101,19 @@ impl fmt::Debug for HipDriver {
             .field("driver_path", &self.driver_path)
             .finish()
     }
+}
+
+struct HipSweepOutcome {
+    range: MemoryRange,
+    duration_us: u64,
+    pages_zeroed: u64,
+    vram_total_bytes: u64,
+    vram_free_bytes: u64,
+    swept_bytes: u64,
+    chunk_count: u32,
+    chunk_table_sha256: String,
+    verification_mode: VerificationMode,
+    captured: BTreeMap<u64, PageSample>,
 }
 
 fn hip_check(symbol: &'static str, code: HipError) -> Result<(), HalError> {
@@ -157,6 +175,8 @@ impl HipDriver {
 
         let hip_get_device_count: FnHipGetDeviceCount = load_symbol(&lib, b"hipGetDeviceCount\0")?;
         let hip_set_device: FnHipSetDevice = load_symbol(&lib, b"hipSetDevice\0")?;
+        let hip_device_get_name: Option<FnHipDeviceGetName> =
+            load_symbol(&lib, b"hipDeviceGetName\0").ok();
         let hip_device_get_pci_bus_id: Option<FnHipDeviceGetPciBusId> =
             load_symbol(&lib, b"hipDeviceGetPCIBusId\0").ok();
         let hip_mem_get_info: FnHipMemGetInfo = load_symbol(&lib, b"hipMemGetInfo\0")?;
@@ -171,6 +191,7 @@ impl HipDriver {
             driver_path,
             hip_get_device_count,
             hip_set_device,
+            hip_device_get_name,
             hip_device_get_pci_bus_id,
             hip_mem_get_info,
             hip_malloc,
@@ -185,13 +206,16 @@ impl HipDriver {
     fn enumerate_devices(&self) -> Result<Vec<(i32, DeviceDescriptor)>, HalError> {
         let mut count: i32 = 0;
         // SAFETY: Valid pointer to `i32`.
-        hip_check("hipGetDeviceCount", unsafe { (self.hip_get_device_count)(&mut count) })?;
+        hip_check("hipGetDeviceCount", unsafe {
+            (self.hip_get_device_count)(&mut count)
+        })?;
 
         let device_count = usize::try_from(count).unwrap_or(0);
         let mut result = Vec::with_capacity(device_count);
 
         for ordinal in 0..device_count {
             let dev_id = i32::try_from(ordinal).unwrap_or(0);
+            let ord_u32 = u32::try_from(ordinal).unwrap_or(u32::MAX);
             // SAFETY: Valid device ordinal.
             hip_check("hipSetDevice", unsafe { (self.hip_set_device)(dev_id) })?;
 
@@ -201,6 +225,31 @@ impl HipDriver {
             hip_check("hipMemGetInfo", unsafe {
                 (self.hip_mem_get_info)(&mut free_bytes, &mut total_bytes)
             })?;
+
+            let name = if let Some(get_name) = self.hip_device_get_name {
+                let mut name_buf = [0 as c_char; 256];
+                // SAFETY: Valid 256-byte buffer; we force trailing NUL.
+                let rc = unsafe { (get_name)(name_buf.as_mut_ptr(), 255, dev_id) };
+                if rc == HIP_SUCCESS {
+                    if let Some(last) = name_buf.last_mut() {
+                        *last = 0;
+                    }
+                    // SAFETY: Guaranteed NUL-terminated.
+                    let raw = unsafe { CStr::from_ptr(name_buf.as_ptr()) }
+                        .to_string_lossy()
+                        .trim()
+                        .to_string();
+                    if raw.is_empty() {
+                        "AMD ROCm GPU".to_string()
+                    } else {
+                        raw
+                    }
+                } else {
+                    "AMD ROCm GPU".to_string()
+                }
+            } else {
+                "AMD ROCm GPU".to_string()
+            };
 
             let pci_bus_id = if let Some(get_pci) = self.hip_device_get_pci_bus_id {
                 let mut pci_buf = [0 as c_char; 64];
@@ -223,18 +272,18 @@ impl HipDriver {
             };
 
             let device_uuid = deterministic_device_uuid(0x02, ordinal, &pci_bus_id);
-            let label = "AMD Instinct ROCm GPU".to_string();
-            let (model, tpp_rating) = infer_model_from_name(&label, AcceleratorVendor::Amd);
+            let (model, tpp_rating) = infer_model_from_name(&name, AcceleratorVendor::Amd);
 
             result.push((
                 dev_id,
                 DeviceDescriptor {
                     device_uuid,
+                    device_ordinal: ord_u32,
                     node_name: format!("rocm-host-gpu-{ordinal:02}"),
                     pci_bus_id,
                     vendor: AcceleratorVendor::Amd,
                     model,
-                    vendor_model_label: label,
+                    vendor_model_label: name,
                     sriov_slice_index: None,
                     sriov_parent_uuid: None,
                     tpp_rating,
@@ -255,7 +304,7 @@ impl HipDriver {
         hip_dev: i32,
         sweep_ratio_pct: u8,
         verify_sample_pages: usize,
-    ) -> Result<(MemoryRange, u64, u64, BTreeMap<u64, PageSample>), HalError> {
+    ) -> Result<HipSweepOutcome, HalError> {
         struct HipAllocGuard<'a> {
             driver: &'a HipDriver,
             ptr: *mut c_void,
@@ -265,7 +314,14 @@ impl HipDriver {
             fn drop(&mut self) {
                 if !self.ptr.is_null() {
                     // SAFETY: Pointer was allocated via `hipMalloc` on the active HIP device.
-                    let _ = unsafe { (self.driver.hip_free)(self.ptr) };
+                    let rc = unsafe { (self.driver.hip_free)(self.ptr) };
+                    if rc != HIP_SUCCESS {
+                        tracing::warn!(
+                            hip_error = rc,
+                            len = self.len,
+                            "hipFree failed during teardown"
+                        );
+                    }
                 }
             }
         }
@@ -296,7 +352,7 @@ impl HipDriver {
                 }
 
                 let mut dev_ptr: *mut c_void = ptr::null_mut();
-                // SAFETY: Valid pointer output and 4KB-aligned `request_len`.
+                // SAFETY: Valid pointer output and 4 KiB-aligned `request_len`.
                 let rc = unsafe { (self.hip_malloc)(&mut dev_ptr, request_len) };
                 if rc == HIP_ERROR_OUT_OF_MEMORY {
                     break;
@@ -331,10 +387,15 @@ impl HipDriver {
             (self.hip_device_synchronize)()
         })?;
 
-        let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let sample_target = verify_sample_pages.max(1);
+        let verification_mode = if sample_target == DEFAULT_FALLBACK_SAMPLE_PAGES {
+            VerificationMode::CsprngSampled256Pages
+        } else {
+            VerificationMode::CsprngSampledPages
+        };
 
         let chunk_lengths: Vec<usize> = held_chunks.iter().map(|c| c.len).collect();
-        let targets = select_chunk_verification_targets(&chunk_lengths, verify_sample_pages);
+        let targets = select_csprng_chunk_verification_targets(&chunk_lengths, sample_target);
         let mut captured = BTreeMap::new();
 
         for (c_idx, byte_offset) in targets {
@@ -346,10 +407,11 @@ impl HipDriver {
                 continue;
             };
             let src_addr = u64::try_from(src_usize).unwrap_or(0);
-            let mut host_page = Box::new([0u8; VRAM_PAGE_SIZE_BYTES as usize]);
+            // Pre-poison host buffer with 0xAA so a no-op hipMemcpy fails verification.
+            let mut host_page = Box::new([READBACK_POISON_BYTE; VRAM_PAGE_SIZE_BYTES as usize]);
 
             // SAFETY: `src_usize` lies within live `[chunk.ptr, chunk.ptr + chunk.len)` and
-            // `host_page` is a valid 4096-byte host buffer.
+            // `host_page` is a valid 4096-byte writable host buffer.
             hip_check("hipMemcpy", unsafe {
                 (self.hip_memcpy)(
                     host_page.as_mut_ptr().cast::<c_void>(),
@@ -367,18 +429,53 @@ impl HipDriver {
             );
         }
 
+        if captured.is_empty() {
+            return Err(HalError::NativeDriverFailure {
+                backend: ROCM_BACKEND_NAME,
+                message: format!(
+                    "zero pages captured during ROCm verification on device {device_uuid}"
+                ),
+            });
+        }
+
+        let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+
+        let chunk_pairs: Vec<(u64, u64)> = held_chunks
+            .iter()
+            .map(|c| {
+                (
+                    u64::try_from(c.ptr as usize).unwrap_or(0),
+                    u64::try_from(c.len).unwrap_or(u64::MAX),
+                )
+            })
+            .collect();
+        let chunk_table_sha256 = compute_chunk_table_sha256(&chunk_pairs);
+        let chunk_count = u32::try_from(held_chunks.len()).unwrap_or(u32::MAX);
+
         let first_base = held_chunks
             .first()
             .map(|c| u64::try_from(c.ptr as usize).unwrap_or(u64::from(VRAM_PAGE_SIZE_BYTES)))
             .unwrap_or(u64::from(VRAM_PAGE_SIZE_BYTES));
         let aligned_base = first_base - (first_base % u64::from(VRAM_PAGE_SIZE_BYTES));
-        let swept_len_u64 = u64::try_from(swept_bytes).unwrap_or(u64::from(VRAM_PAGE_SIZE_BYTES));
+        let swept_len_u64 =
+            u64::try_from(swept_bytes).unwrap_or(u64::from(VRAM_PAGE_SIZE_BYTES));
         let range = MemoryRange::new(aligned_base, swept_len_u64)?;
         let pages_zeroed = range.page_count();
 
         drop(held_chunks);
 
-        Ok((range, duration_us, pages_zeroed, captured))
+        Ok(HipSweepOutcome {
+            range,
+            duration_us,
+            pages_zeroed,
+            vram_total_bytes: u64::try_from(total_bytes).unwrap_or(u64::MAX),
+            vram_free_bytes: u64::try_from(free_bytes).unwrap_or(u64::MAX),
+            swept_bytes: swept_len_u64,
+            chunk_count,
+            chunk_table_sha256,
+            verification_mode,
+            captured,
+        })
     }
 }
 
@@ -389,7 +486,7 @@ struct HipDeviceRecord {
     last_captured_samples: BTreeMap<u64, PageSample>,
 }
 
-/// Real dynamic AMD ROCm HIP (`libamdhip64.so` / `amdhip64.dll`) sanitization backend.
+/// Dynamic AMD ROCm HIP (`libamdhip64.so` / `amdhip64.dll`) sanitization backend.
 #[derive(Debug)]
 pub struct RocmAcceleratorBackend {
     pub config: RocmDriverConfig,
@@ -439,11 +536,9 @@ impl AcceleratorDevice for RocmAcceleratorBackend {
 
     async fn discover_devices(&self) -> Result<Vec<DeviceDescriptor>, HalError> {
         let guard = self.devices.read().await;
-        let mut list: Vec<DeviceDescriptor> = guard
-            .values()
-            .map(|r| r.descriptor.clone())
-            .collect();
-        list.sort_by(|a, b| a.node_name.cmp(&b.node_name));
+        let mut list: Vec<DeviceDescriptor> =
+            guard.values().map(|r| r.descriptor.clone()).collect();
+        list.sort_by_key(|d| d.device_ordinal);
         Ok(list)
     }
 
@@ -480,7 +575,10 @@ impl AcceleratorDevice for RocmAcceleratorBackend {
         };
         let aligned_len = rec.descriptor.vram_total_bytes
             - (rec.descriptor.vram_total_bytes % u64::from(VRAM_PAGE_SIZE_BYTES));
-        MemoryRange::new(u64::from(VRAM_PAGE_SIZE_BYTES), aligned_len.max(u64::from(VRAM_PAGE_SIZE_BYTES)))
+        MemoryRange::new(
+            u64::from(VRAM_PAGE_SIZE_BYTES),
+            aligned_len.max(u64::from(VRAM_PAGE_SIZE_BYTES)),
+        )
     }
 
     async fn release_to_dirty(&self, device_uuid: Uuid) -> Result<MemoryRange, HalError> {
@@ -507,11 +605,14 @@ impl AcceleratorDevice for RocmAcceleratorBackend {
         rec.descriptor.state = DeviceState::DirtyPendingScrub {
             last_tenant_hash,
             released_at: Utc::now(),
-            estimated_dirty_ratio_pct: 90,
+            estimated_dirty_ratio_pct: self.config.sweep_free_vram_pct,
         };
         let aligned_len = rec.descriptor.vram_total_bytes
             - (rec.descriptor.vram_total_bytes % u64::from(VRAM_PAGE_SIZE_BYTES));
-        MemoryRange::new(u64::from(VRAM_PAGE_SIZE_BYTES), aligned_len.max(u64::from(VRAM_PAGE_SIZE_BYTES)))
+        MemoryRange::new(
+            u64::from(VRAM_PAGE_SIZE_BYTES),
+            aligned_len.max(u64::from(VRAM_PAGE_SIZE_BYTES)),
+        )
     }
 
     async fn zeroize_range_async(
@@ -547,9 +648,9 @@ impl AcceleratorDevice for RocmAcceleratorBackend {
         let ratio_pct = self.config.sweep_free_vram_pct;
         let sample_pages = self.config.verify_sample_pages;
 
-        let (swept_range, duration_us, pages_zeroed, captured) = tokio::task::spawn_blocking(
-            move || driver.sweep_and_capture_samples(device_uuid, hip_dev, ratio_pct, sample_pages),
-        )
+        let outcome = tokio::task::spawn_blocking(move || {
+            driver.sweep_and_capture_samples(device_uuid, hip_dev, ratio_pct, sample_pages)
+        })
         .await
         .map_err(|err| HalError::NativeDriverFailure {
             backend: ROCM_BACKEND_NAME,
@@ -559,16 +660,24 @@ impl AcceleratorDevice for RocmAcceleratorBackend {
         {
             let mut guard = self.devices.write().await;
             if let Some(rec) = guard.get_mut(&device_uuid) {
-                rec.last_captured_samples = captured;
+                rec.last_captured_samples = outcome.captured;
             }
         }
 
         Ok(ZeroizeReceipt {
             device_uuid,
-            range: swept_range,
-            duration_us,
-            pages_zeroed,
+            range: outcome.range,
+            duration_us: outcome.duration_us,
+            pages_zeroed: outcome.pages_zeroed,
             backend_kind: BackendKind::RocmNative,
+            vram_total_bytes: outcome.vram_total_bytes,
+            vram_free_bytes: outcome.vram_free_bytes,
+            swept_bytes: outcome.swept_bytes,
+            chunk_count: outcome.chunk_count,
+            chunk_table_sha256: outcome.chunk_table_sha256,
+            active_processes_before: 0,
+            verification_mode: outcome.verification_mode,
+            gpu_reduction: None,
         })
     }
 

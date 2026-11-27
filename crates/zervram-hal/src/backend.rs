@@ -5,7 +5,7 @@ use crate::error::HalError;
 use crate::model::{BackendKind, DeviceDescriptor, MemoryRange, PageSample, ZeroizeReceipt};
 
 /// Unified asynchronous Hardware Abstraction Layer across `mock-gpu` and native vendor runtimes.
-/// Object-safe (`Arc<dyn AcceleratorDevice>`) for dependency injection into `zervram-scrub` and `zervram-k8s`.
+/// Object-safe (`Arc<dyn AcceleratorDevice>`) for dependency injection into `zervram-scrub`.
 #[async_trait]
 pub trait AcceleratorDevice: Send + Sync + 'static {
     fn backend_kind(&self) -> BackendKind;
@@ -27,26 +27,25 @@ pub trait AcceleratorDevice: Send + Sync + 'static {
     async fn release_to_dirty(&self, device_uuid: Uuid) -> Result<MemoryRange, HalError>;
 
     /// Asynchronously zeroizes the target VRAM address range.
-    /// - `mock-gpu`: deterministic `zeroize::Zeroize` across mapped 4KB page buffers (<3ms)
-    /// - `cuda-native`: `cuMemsetD8Async` + stream sync
-    /// - `rocm-native`: `hipMemsetAsync` + stream sync
-    /// - `tt-metalium-native`: TT-Metalium DRAM/L1 buffer zeroing
-    /// - `furiosa-native`: RNGD SR-IOV HBM3/SRAM zeroing
+    /// - `mock-gpu`: deterministic `zeroize::Zeroize` across mapped 4 KiB page buffers (<3 ms)
+    /// - `cuda-native`: NVML active-process gate + `cuMemsetD32Async` + PTX full OR-reduction + CSPRNG canary read-back
+    /// - `rocm-native`: `hipMemsetAsync` + sync + CSPRNG 256-page poisoned read-back
+    /// - `tt-metalium-native`: `experimental-stub` (vendor FFI not yet linked)
+    /// - `furiosa-native`: `experimental-stub` (vendor FFI not yet linked)
     async fn zeroize_range_async(
         &self,
         device_uuid: Uuid,
         range: MemoryRange,
     ) -> Result<ZeroizeReceipt, HalError>;
 
-    /// Reads back requested 4KB-aligned device pages for `0x00` verification prior to attestation.
+    /// Reads back requested 4 KiB-aligned device pages for `0x00` verification prior to attestation.
     async fn read_back_pages(
         &self,
         device_uuid: Uuid,
         page_addrs: &[u64],
     ) -> Result<Vec<PageSample>, HalError>;
 
-    /// Returns all mapped 4KB page addresses for deterministic full-buffer verification in `mock-gpu`
-    /// (returns `None` on native hardware where stratified random spot sampling is used).
+    /// Returns mapped/captured 4 KiB page addresses for verification.
     async fn mapped_verification_pages(
         &self,
         device_uuid: Uuid,
@@ -61,7 +60,7 @@ pub trait AcceleratorDevice: Send + Sync + 'static {
         scrub_duration_us: u64,
     ) -> Result<(), HalError>;
 
-    /// Permanently removes a device slice from scheduling if residual non-zero pages are detected.
+    /// Removes a device slice from scheduling if residual non-zero pages or hardware faults are detected.
     async fn quarantine_device(
         &self,
         device_uuid: Uuid,
@@ -69,5 +68,5 @@ pub trait AcceleratorDevice: Send + Sync + 'static {
     ) -> Result<(), HalError>;
 }
 
-/// Alias preserving compatibility with `ARCHITECTURE.md` references to `AcceleratorBackend`.
+/// Alias preserving compatibility with `AcceleratorBackend` references.
 pub use AcceleratorDevice as AcceleratorBackend;

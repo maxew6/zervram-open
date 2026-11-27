@@ -14,6 +14,12 @@ pub enum ScrubError {
         non_zero_bytes: usize,
     },
 
+    #[error("device {device_uuid} is quarantined and blocked from scheduling: {reason}")]
+    DeviceQuarantined { device_uuid: Uuid, reason: String },
+
+    #[error("zeroization verification sampled 0 pages on device {device_uuid}; refusing vacuous verified_zero")]
+    EmptyVerificationSample { device_uuid: Uuid },
+
     #[error("zeroization SLA exceeded on device {device_uuid}: {duration_us}us > {sla_max_us}us")]
     SlaBudgetExceeded {
         device_uuid: Uuid,
@@ -23,6 +29,18 @@ pub enum ScrubError {
 
     #[error("cryptographic signing failure: {0}")]
     SigningFailure(String),
+
+    #[error("persistent storage failure: {0}")]
+    StorageFailure(String),
+
+    #[error("certificate verification failed: {0}")]
+    VerificationFailure(String),
+
+    #[error("invalid certificate field `{field}`: {details}")]
+    InvalidCertificateField {
+        field: &'static str,
+        details: String,
+    },
 
     #[error("certificate {cert_id} not found")]
     CertificateNotFound { cert_id: Uuid },
@@ -38,5 +56,8 @@ pub enum ScrubError {
     InvalidSignature { cert_id: Uuid },
 
     #[error("invalid hex encoding in field {field}: {details}")]
-    InvalidHex { field: &'static str, details: String },
+    InvalidHex {
+        field: &'static str,
+        details: String,
+    },
 }

@@ -6,7 +6,7 @@ use crate::error::HalError;
 use crate::model::{BackendKind, DeviceDescriptor, MemoryRange, PageSample, ZeroizeReceipt};
 use crate::native::common::NativeBackendCore;
 
-const FURIOSA_BACKEND_NAME: &str = "furiosa-native";
+const FURIOSA_BACKEND_NAME: &str = "furiosa-native (experimental-stub)";
 const FURIOSA_DRIVER_CANDIDATES: &[&str] = &[
     "/usr/lib/x86_64-linux-gnu/libfuriosa_hal.so",
     "/usr/local/lib/libfuriosa_hal.so",
@@ -27,7 +27,8 @@ impl Default for FuriosaDriverConfig {
     }
 }
 
-/// Native FuriosaAI RNGD SR-IOV HBM3/SRAM slice sanitization backend (8x 1,024-TPP slices).
+/// EXPERIMENTAL STUB: FuriosaAI RNGD native FFI bindings are not yet implemented.
+/// All memory operations fail closed until vendor SDK FFI integration is linked.
 #[derive(Debug)]
 pub struct FuriosaAcceleratorBackend {
     pub config: FuriosaDriverConfig,

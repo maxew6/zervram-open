@@ -4,23 +4,32 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 [lints]
 workspace = true
 
 [features]
-# Compiles cleanly on Windows/Linux with zero C/CUDA/ROCm SDKs via runtime libloading
+# Compiles cleanly on Windows/Linux with zero compile-time C/CUDA/ROCm SDK headers.
+# Runtime execution on physical GPUs requires the proprietary NVIDIA CUDA/NVML or AMD ROCm driver.
 default = ["mock-gpu", "cuda-native", "rocm-native"]
-mock-gpu = ["dep:rand", "dep:rand_chacha", "dep:zeroize"]
+mock-gpu = ["dep:zeroize"]
 cuda-native = ["dep:libloading"]
 rocm-native = ["dep:libloading"]
+# experimental-stub: vendor SDK FFI bindings are not yet linked
 tt-metalium-native = []
+# experimental-stub: vendor SDK FFI bindings are not yet linked
 furiosa-native = []
 
 [dependencies]
 async-trait = { workspace = true }
 chrono      = { workspace = true }
+hex         = { workspace = true }
+rand        = { workspace = true }
+rand_chacha = { workspace = true }
 serde       = { workspace = true }
+sha2        = { workspace = true }
 thiserror   = { workspace = true }
 tokio       = { workspace = true }
 tracing     = { workspace = true }
@@ -29,9 +38,7 @@ uuid        = { workspace = true }
 # Runtime dynamic driver loader (zero compile-time SDK headers required)
 libloading  = { workspace = true, optional = true }
 
-# Optional dependencies used solely by mock-gpu
-rand        = { workspace = true, optional = true }
-rand_chacha = { workspace = true, optional = true }
+# Optional dependency used solely by mock-gpu host page zeroing
 zeroize     = { workspace = true, optional = true }
 
 [dev-dependencies]

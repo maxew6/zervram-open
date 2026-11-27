@@ -6,7 +6,7 @@ use crate::error::HalError;
 use crate::model::{BackendKind, DeviceDescriptor, MemoryRange, PageSample, ZeroizeReceipt};
 use crate::native::common::NativeBackendCore;
 
-const TT_BACKEND_NAME: &str = "tt-metalium-native";
+const TT_BACKEND_NAME: &str = "tt-metalium-native (experimental-stub)";
 const TT_DRIVER_CANDIDATES: &[&str] = &[
     "/usr/local/lib/libtt_metal.so",
     "/opt/tenstorrent/lib/libtt_metal.so",
@@ -27,7 +27,8 @@ impl Default for TtMetaliumConfig {
     }
 }
 
-/// Native Tenstorrent TT-Metalium DRAM & L1 SRAM buffer-zeroing backend for Blackhole p150.
+/// EXPERIMENTAL STUB: Tenstorrent TT-Metalium native FFI bindings are not yet implemented.
+/// All memory operations fail closed until vendor SDK FFI integration is linked.
 #[derive(Debug)]
 pub struct TtMetaliumBackend {
     pub config: TtMetaliumConfig,

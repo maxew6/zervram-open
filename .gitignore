@@ -1,6 +1,18 @@
-/target
+/target/
+**/*.rs.bk
 *.pdb
-*.log
-node.key
+
+# Local signing keys, runtime chain state, and exported test certificates
 *.key
-*.pem
+chain.jsonl
+chain.jsonl.lock
+quarantine.json
+quarantine.json.lock
+cert.json
+cert_*.json
+
+# OS / editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

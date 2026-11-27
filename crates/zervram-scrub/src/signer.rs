@@ -1,10 +1,13 @@
 use std::fmt;
+use std::fs::OpenOptions;
+use std::io::{ErrorKind, Write};
 use std::path::Path;
 
 use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey, spki::der::pem::LineEnding};
-
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use zeroize::Zeroize;
 
+use crate::certificate::parse_verifying_key;
 use crate::error::ScrubError;
 
 pub trait AttestationSigner: Send + Sync + 'static {
@@ -55,27 +58,30 @@ impl Ed25519Signer {
         let pem = self
             .signing_key
             .to_pkcs8_pem(LineEnding::LF)
-            .map_err(|err| ScrubError::SigningFailure(format!("PKCS#8 PEM encoding failed: {err}")))?;
+            .map_err(|err| {
+                ScrubError::SigningFailure(format!("PKCS#8 PEM encoding failed: {err}"))
+            })?;
         Ok(pem.as_str().to_string())
     }
 
-    /// Loads an existing PKCS#8 Ed25519 PEM key from `path`, or generates and persists a new key
-    /// so minted certificates remain cryptographically verifiable across subprocess runs and reboots.
-    /// Returns `(signer, created_new)`.
+    /// Atomically loads an existing PKCS#8 Ed25519 PEM key from `path`, or generates and persists
+    /// a new key with `create_new(true)` (and `0o600` mode at creation time on Unix, propagating
+    /// any permission error). Returns `(signer, created_new)`.
     pub fn load_or_generate_key_file(path: &Path) -> Result<(Self, bool), ScrubError> {
-        if path.exists() {
-            let pem = std::fs::read_to_string(path).map_err(|err| {
-                ScrubError::SigningFailure(format!(
+        match std::fs::read_to_string(path) {
+            Ok(mut pem) => {
+                let signer = Self::from_pkcs8_pem(&pem);
+                pem.zeroize();
+                return Ok((signer?, false));
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(ScrubError::SigningFailure(format!(
                     "failed to read signing key '{}': {err}",
                     path.display()
-                ))
-            })?;
-            let signer = Self::from_pkcs8_pem(&pem)?;
-            return Ok((signer, false));
+                )));
+            }
         }
-
-        let signer = Self::generate_ephemeral();
-        let pem = signer.to_pkcs8_pem()?;
 
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -88,21 +94,65 @@ impl Ed25519Signer {
             }
         }
 
-        std::fs::write(path, pem.as_bytes()).map_err(|err| {
-            ScrubError::SigningFailure(format!(
-                "failed to persist signing key '{}': {err}",
-                path.display()
-            ))
-        })?;
+        let signer = Self::generate_ephemeral();
+        let mut pem = signer.to_pkcs8_pem()?;
 
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            let _ = std::fs::set_permissions(path, perms);
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
         }
 
-        Ok((signer, true))
+        match opts.open(path) {
+            Ok(mut file) => {
+                let write_res = file
+                    .write_all(pem.as_bytes())
+                    .and_then(|()| file.sync_all());
+                pem.zeroize();
+                drop(file);
+                write_res.map_err(|err| {
+                    ScrubError::SigningFailure(format!(
+                        "failed to persist signing key '{}': {err}",
+                        path.display()
+                    ))
+                })?;
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let perms = std::fs::Permissions::from_mode(0o600);
+                    std::fs::set_permissions(path, perms).map_err(|err| {
+                        ScrubError::SigningFailure(format!(
+                            "failed to enforce 0600 permissions on '{}': {err}",
+                            path.display()
+                        ))
+                    })?;
+                }
+
+                Ok((signer, true))
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                pem.zeroize();
+                let mut existing = std::fs::read_to_string(path).map_err(|read_err| {
+                    ScrubError::SigningFailure(format!(
+                        "concurrent key creation detected but failed to read '{}': {read_err}",
+                        path.display()
+                    ))
+                })?;
+                let loaded = Self::from_pkcs8_pem(&existing);
+                existing.zeroize();
+                Ok((loaded?, false))
+            }
+            Err(err) => {
+                pem.zeroize();
+                Err(ScrubError::SigningFailure(format!(
+                    "failed to atomically create signing key '{}': {err}",
+                    path.display()
+                )))
+            }
+        }
     }
 
     pub fn verifying_key(&self) -> VerifyingKey {
@@ -112,6 +162,25 @@ impl Ed25519Signer {
     pub fn clone_signing_key(&self) -> SigningKey {
         self.signing_key.clone()
     }
+}
+
+/// Loads an Ed25519 verifying key from either a PKCS#8 PEM private key file (`node.key`) or a
+/// 64-character hex public key file (`.pub` / `.hex`).
+pub fn load_verifying_key_from_file(path: &Path) -> Result<VerifyingKey, ScrubError> {
+    let mut raw = std::fs::read_to_string(path).map_err(|err| {
+        ScrubError::VerificationFailure(format!(
+            "failed to read key file '{}': {err}",
+            path.display()
+        ))
+    })?;
+    let trimmed = raw.trim();
+    let result = if trimmed.contains("BEGIN PRIVATE KEY") {
+        Ed25519Signer::from_pkcs8_pem(trimmed).map(|s| s.verifying_key())
+    } else {
+        parse_verifying_key(trimmed)
+    };
+    raw.zeroize();
+    result
 }
 
 impl AttestationSigner for Ed25519Signer {
@@ -143,14 +212,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn persists_and_reloads_pkcs8_ed25519_key_across_restarts() -> Result<(), ScrubError> {
+    fn persists_and_reloads_pkcs8_ed25519_key_atomically() -> Result<(), ScrubError> {
         let tmp = std::env::temp_dir().join(format!("zervram_key_{}.key", Uuid::new_v4()));
         let (first, created_first) = Ed25519Signer::load_or_generate_key_file(&tmp)?;
         assert!(created_first);
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&tmp)
+                .map_err(|e| ScrubError::SigningFailure(e.to_string()))?
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
         let (second, created_second) = Ed25519Signer::load_or_generate_key_file(&tmp)?;
         assert!(!created_second);
         assert_eq!(first.verifying_key_hex(), second.verifying_key_hex());
+
+        let loaded_vk = load_verifying_key_from_file(&tmp)?;
+        assert_eq!(loaded_vk, first.verifying_key());
 
         let digest = [0x42u8; 32];
         let sig = first.sign_digest(&digest)?;

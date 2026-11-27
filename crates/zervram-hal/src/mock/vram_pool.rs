@@ -13,13 +13,13 @@ use crate::model::{MemoryRange, PageSample, VRAM_PAGE_SIZE_BYTES};
 #[derive(Debug)]
 pub struct SimulatedVramPool {
     pub active_range: MemoryRange,
-    /// Real host-RAM 4KB page frames keyed by virtual VRAM page address.
+    /// Real host-RAM 4 KiB page frames keyed by virtual VRAM page address.
     /// Cleared with `zeroize::Zeroize` to prevent compiler dead-store elimination without `unsafe`.
     pub pages: BTreeMap<u64, Box<[u8; VRAM_PAGE_SIZE_BYTES as usize]>>,
 }
 
 impl SimulatedVramPool {
-    /// Allocates `backing_pages` real 4KB host-RAM page frames evenly distributed across
+    /// Allocates `backing_pages` real 4 KiB host-RAM page frames evenly distributed across
     /// `active_range`, always covering the first and last boundary pages when `backing_pages >= 2`.
     pub fn new(active_range: MemoryRange, backing_pages: usize) -> Self {
         let total_pages = active_range.page_count().max(1);
@@ -54,7 +54,7 @@ impl SimulatedVramPool {
         }
     }
 
-    /// Populates all mapped 4KB page frames with deterministic non-zero tenant weight/prompt data.
+    /// Populates all mapped 4 KiB page frames with deterministic non-zero tenant weight/prompt data.
     pub fn taint_for_tenant(
         &mut self,
         rng: &mut ChaCha8Rng,
@@ -84,8 +84,9 @@ impl SimulatedVramPool {
         }
     }
 
-    /// Simulates the `LeftoverLocals` vulnerability upon job exit: ~82%–88% of pages are cleared
-    /// by normal allocator release while 12%–18% remain dirty with previous tenant data in RAM.
+    /// Synthetic test retention model for `mock-gpu`: clears most pages on release while retaining
+    /// `min_pct..=max_pct` dirty pages (default `12..=18%` is an arbitrary synthetic test
+    /// parameter for CI/unit testing, NOT an empirical measurement on NVIDIA HBM/GDDR hardware).
     pub fn simulate_leftover_locals_on_release(
         &mut self,
         rng: &mut ChaCha8Rng,
@@ -129,7 +130,7 @@ impl SimulatedVramPool {
         dirty_pct
     }
 
-    /// Cryptographically zeroizes every mapped 4KB page inside `range` using `zeroize::Zeroize`,
+    /// Zeroizes every mapped 4 KiB page inside `range` using `zeroize::Zeroize`,
     /// returning `(elapsed_us, pages_zeroed)`.
     pub fn zeroize_range(&mut self, range: MemoryRange) -> Result<(u64, u64), HalError> {
         if !self.active_range.contains_range(&range) {
