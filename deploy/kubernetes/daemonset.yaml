@@ -1,0 +1,77 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: zervram-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: zervramd
+  namespace: zervram-system
+  labels:
+    app.kubernetes.io/name: zervramd
+    app.kubernetes.io/version: "0.4.0"
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: zervramd
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: zervramd
+    spec:
+      runtimeClassName: nvidia
+      hostNetwork: true
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: zervramd
+          image: ghcr.io/maxew6/zervram:0.4.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --listen
+            - 127.0.0.1:9740
+            - --state-dir
+            - /var/lib/zervram
+            - --key-file
+            - /etc/zervram/node.key
+          env:
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "compute,utility"
+            - name: ZERVRAM_DAEMON_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: zervramd-auth
+                  key: token
+                  optional: true
+          ports:
+            - name: http-rpc
+              containerPort: 9740
+              hostPort: 9740
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: zervram-state
+              mountPath: /var/lib/zervram
+            - name: zervram-etc
+              mountPath: /etc/zervram
+      volumes:
+        - name: zervram-state
+          hostPath:
+            path: /var/lib/zervram
+            type: DirectoryOrCreate
+        - name: zervram-etc
+          hostPath:
+            path: /etc/zervram
+            type: DirectoryOrCreate

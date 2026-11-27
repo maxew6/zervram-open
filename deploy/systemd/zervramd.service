@@ -1,0 +1,32 @@
+[Unit]
+Description=Zervram Persistent Warm GPU VRAM Sanitization Daemon (zervramd)
+After=network.target nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/zervramd \
+  --listen 127.0.0.1:9740 \
+  --state-dir /var/lib/zervram \
+  --key-file /etc/zervram/node.key \
+  --token-file /etc/zervram/daemon.token
+Restart=always
+RestartSec=2s
+LimitNOFILE=65536
+StateDirectory=zervram
+StateDirectoryMode=0750
+ConfigurationDirectory=zervram
+ConfigurationDirectoryMode=0750
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/var/lib/zervram /etc/zervram
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

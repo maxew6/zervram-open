@@ -1,12 +1,16 @@
 #![forbid(unsafe_code)]
 
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use ed25519_dalek::VerifyingKey;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::net::TcpStream;
 use zervram_hal::{
     connect_physical_backend_with_options, AcceleratorDevice, BackendKind, DeviceState, HalError,
     PhysicalBackendOptions,
@@ -18,6 +22,8 @@ use zervram_scrub::{
     ScrubConfig, ScrubError, ScrubRequest, VerifyPolicy, VramScrubber, VramZeroEngine,
     EXIT_CODE_QUARANTINED,
 };
+
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Error)]
 enum BinError {
@@ -38,6 +44,36 @@ enum BinError {
 
     #[error("verification failed: {0}")]
     VerificationFailed(String),
+
+    #[error("daemon quarantined device: {0}")]
+    DaemonQuarantined(String),
+
+    #[error("daemon RPC failed: {0}")]
+    DaemonRpc(String),
+}
+
+#[derive(Debug)]
+enum DaemonCallError {
+    Unreachable(String),
+    Quarantined(String),
+    Failed(String),
+}
+
+#[derive(Debug, Serialize)]
+struct DaemonScrubPayload {
+    device: usize,
+    allow_mock: bool,
+    challenge_nonce: Option<String>,
+    tenant_id: Option<String>,
+    job_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DaemonErrorPayload {
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    error: String,
 }
 
 #[derive(Debug, Parser)]
@@ -97,6 +133,22 @@ struct Cli {
     /// Optional file path to write the JSON attestation bundle (for `zervram-scrub verify`).
     #[arg(long)]
     out_cert: Option<PathBuf>,
+
+    /// Route scrub request to a warm local `zervramd` instance (e.g., `http://127.0.0.1:9740`).
+    #[arg(long)]
+    daemon_url: Option<String>,
+
+    /// Fall back to direct cold CLI scrub ONLY if `--daemon-url` is unreachable.
+    #[arg(long, default_value_t = false)]
+    fallback_direct: bool,
+
+    /// Optional bearer token file when authenticating to `zervramd`.
+    #[arg(long)]
+    token_file: Option<PathBuf>,
+
+    /// Optional bearer token string (or `ZERVRAM_DAEMON_TOKEN` env var) for `zervramd`.
+    #[arg(long, env = "ZERVRAM_DAEMON_TOKEN", hide_env_values = true)]
+    daemon_token: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -230,7 +282,315 @@ fn resolve_trusted_keys(
     Ok(keys)
 }
 
+fn load_client_token(
+    token_file: Option<&Path>,
+    cli_token: Option<&str>,
+) -> Result<Option<String>, BinError> {
+    if let Some(path) = token_file {
+        let raw = std::fs::read_to_string(path)?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(BinError::InvalidInput(format!(
+                "--token-file '{}' is empty",
+                path.display()
+            )));
+        }
+        return Ok(Some(trimmed.to_string()));
+    }
+    if let Some(tok) = cli_token {
+        let trimmed = tok.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some(trimmed.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+fn parse_daemon_authority(raw_url: &str) -> Result<String, DaemonCallError> {
+    let trimmed = raw_url.trim().trim_end_matches('/');
+    let Some(rest) = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("HTTP://"))
+    else {
+        return Err(DaemonCallError::Failed(format!(
+            "unsupported --daemon-url '{raw_url}' (must start with http://)"
+        )));
+    };
+    if rest.is_empty() || rest.contains('/') || rest.chars().any(char::is_whitespace) {
+        return Err(DaemonCallError::Failed(format!(
+            "invalid --daemon-url authority '{raw_url}'"
+        )));
+    }
+    Ok(rest.to_string())
+}
+
+async fn write_all_tcp(stream: &TcpStream, mut data: &[u8]) -> std::io::Result<()> {
+    while !data.is_empty() {
+        stream.writable().await?;
+        match stream.try_write(data) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    "short TCP write",
+                ));
+            }
+            Ok(n) => data = data.get(n..).unwrap_or(&[]),
+            Err(err) if err.kind() == ErrorKind::WouldBlock => continue,
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+async fn read_some_tcp(stream: &TcpStream, buf: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        stream.readable().await?;
+        match stream.try_read(buf) {
+            Ok(n) => return Ok(n),
+            Err(err) if err.kind() == ErrorKind::WouldBlock => continue,
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn call_daemon_scrub(
+    daemon_url: &str,
+    bearer_token: Option<&str>,
+    payload: &DaemonScrubPayload,
+) -> Result<AttestationBundle, DaemonCallError> {
+    let authority = parse_daemon_authority(daemon_url)?;
+    let stream = match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&authority))
+        .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(err)) => {
+            return Err(DaemonCallError::Unreachable(format!(
+                "connect to {authority} failed: {err}"
+            )));
+        }
+        Err(_) => {
+            return Err(DaemonCallError::Unreachable(format!(
+                "timed out connecting to {authority}"
+            )));
+        }
+    };
+    let _ = stream.set_nodelay(true);
+
+    let body = serde_json::to_vec(payload)
+        .map_err(|e| DaemonCallError::Failed(format!("JSON encode failed: {e}")))?;
+    let auth_line = match bearer_token {
+        Some(tok) => {
+            if tok.contains('\r') || tok.contains('\n') {
+                return Err(DaemonCallError::Failed(
+                    "bearer token contains invalid newline characters".to_string(),
+                ));
+            }
+            format!("Authorization: Bearer {tok}\r\n")
+        }
+        None => String::new(),
+    };
+    let req_head = format!(
+        "POST /v1/scrub HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{auth_line}Connection: close\r\n\r\n",
+        body.len()
+    );
+
+    write_all_tcp(&stream, req_head.as_bytes())
+        .await
+        .map_err(|e| DaemonCallError::Failed(format!("failed writing request headers: {e}")))?;
+    write_all_tcp(&stream, &body)
+        .await
+        .map_err(|e| DaemonCallError::Failed(format!("failed writing request body: {e}")))?;
+
+    let mut raw: Vec<u8> = Vec::with_capacity(2048);
+    let mut buf = [0u8; 4096];
+    let mut header_end: Option<usize> = None;
+    let mut content_len: Option<usize> = None;
+
+    let read_res = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let n = read_some_tcp(&stream, &mut buf)
+                .await
+                .map_err(|e| DaemonCallError::Failed(format!("read error: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            if let Some(slice) = buf.get(..n) {
+                raw.extend_from_slice(slice);
+            }
+            if raw.len() > MAX_RESPONSE_BYTES {
+                return Err(DaemonCallError::Failed(
+                    "daemon HTTP response exceeded 1 MiB".to_string(),
+                ));
+            }
+            if header_end.is_none() {
+                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    header_end = Some(pos);
+                    if let Some(hbytes) = raw.get(..pos) {
+                        if let Ok(htext) = std::str::from_utf8(hbytes) {
+                            for line in htext.split("\r\n").skip(1) {
+                                if let Some((k, v)) = line.split_once(':') {
+                                    if k.trim().eq_ignore_ascii_case("content-length") {
+                                        content_len = v.trim().parse::<usize>().ok();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let (Some(hend), Some(clen)) = (header_end, content_len) {
+                if raw.len() >= hend.saturating_add(4).saturating_add(clen) {
+                    break;
+                }
+            }
+        }
+        Ok::<(), DaemonCallError>(())
+    })
+    .await;
+
+    match read_res {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(DaemonCallError::Failed(
+                "timed out awaiting daemon /v1/scrub response".to_string(),
+            ));
+        }
+    }
+
+    let hend = header_end.ok_or_else(|| {
+        DaemonCallError::Failed("malformed HTTP response from daemon (no header terminator)".to_string())
+    })?;
+    let hbytes = raw
+        .get(..hend)
+        .ok_or_else(|| DaemonCallError::Failed("malformed HTTP response headers".to_string()))?;
+    let htext = std::str::from_utf8(hbytes)
+        .map_err(|_| DaemonCallError::Failed("non-UTF8 HTTP response headers".to_string()))?;
+    let status_line = htext
+        .split("\r\n")
+        .next()
+        .ok_or_else(|| DaemonCallError::Failed("missing HTTP status line".to_string()))?;
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| DaemonCallError::Failed(format!("invalid HTTP status line '{status_line}'")))?;
+
+    let mut resp_body = raw.get(hend.saturating_add(4)..).unwrap_or(&[]).to_vec();
+    if let Some(clen) = content_len {
+        if resp_body.len() < clen {
+            return Err(DaemonCallError::Failed(
+                "truncated HTTP response body from daemon".to_string(),
+            ));
+        }
+        resp_body.truncate(clen);
+    }
+
+    if status == 200 {
+        serde_json::from_slice::<AttestationBundle>(&resp_body).map_err(|e| {
+            DaemonCallError::Failed(format!("failed to parse AttestationBundle JSON: {e}"))
+        })
+    } else if status == 423 {
+        let msg = serde_json::from_slice::<DaemonErrorPayload>(&resp_body)
+            .map(|p| p.error)
+            .unwrap_or_else(|_| String::from_utf8_lossy(&resp_body).into_owned());
+        Err(DaemonCallError::Quarantined(msg))
+    } else {
+        let detail = serde_json::from_slice::<DaemonErrorPayload>(&resp_body)
+            .map(|p| format!("[{}] {}", p.code, p.error))
+            .unwrap_or_else(|_| String::from_utf8_lossy(&resp_body).into_owned());
+        Err(DaemonCallError::Failed(format!(
+            "HTTP {status} from {daemon_url}: {detail}"
+        )))
+    }
+}
+
+fn emit_bundle(
+    bundle: &AttestationBundle,
+    out_cert: Option<&Path>,
+    json: bool,
+    source_label: &str,
+    source_value: &str,
+) -> Result<(), BinError> {
+    let json_text = serde_json::to_string_pretty(bundle)?;
+    if let Some(out_path) = out_cert {
+        if let Some(parent) = out_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        std::fs::write(out_path, json_text.as_bytes())?;
+    }
+
+    if json {
+        println!("{json_text}");
+    } else {
+        println!("ZERVRAM VRAM SANITIZATION VERIFIED (v2)");
+        println!("  Schema           : {}", bundle.certificate.schema_version);
+        println!("  Backend          : {:?}", bundle.certificate.backend_kind);
+        println!(
+            "  Device [{}]       : {} ({})",
+            bundle.certificate.device_ordinal,
+            bundle.certificate.vendor_model,
+            bundle.certificate.device_uuid
+        );
+        println!(
+            "  Swept / Free     : {} / {} bytes ({} chunks)",
+            bundle.certificate.swept_bytes,
+            bundle.certificate.vram_free_bytes,
+            bundle.certificate.chunk_count
+        );
+        println!(
+            "  Verification     : {:?} ({} bytes verified, {} canary pages)",
+            bundle.certificate.verification_mode,
+            bundle.certificate.verified_bytes,
+            bundle.certificate.sampled_pages
+        );
+        println!("  Duration         : {} us", bundle.certificate.duration_us);
+        println!("  Prev Cert SHA256 : {}", bundle.certificate.prev_cert_sha256);
+        println!("  Cert SHA-256     : {}", bundle.certificate_sha256);
+        println!("  {source_label:<16} : {source_value}");
+        println!("  Ed25519 PubKey   : {}", bundle.ed25519_public_key_hex);
+    }
+    Ok(())
+}
+
 async fn run_scrub(cli: Cli) -> Result<(), BinError> {
+    if let Some(ref daemon_url) = cli.daemon_url {
+        let token = load_client_token(cli.token_file.as_deref(), cli.daemon_token.as_deref())?;
+        let payload = DaemonScrubPayload {
+            device: cli.device,
+            allow_mock: cli.allow_mock,
+            challenge_nonce: cli.nonce.clone(),
+            tenant_id: Some(cli.tenant_id.clone()),
+            job_id: Some(cli.job_id.clone()),
+        };
+        match call_daemon_scrub(daemon_url, token.as_deref(), &payload).await {
+            Ok(bundle) => {
+                return emit_bundle(
+                    &bundle,
+                    cli.out_cert.as_deref(),
+                    cli.json,
+                    "Daemon URL",
+                    daemon_url,
+                );
+            }
+            Err(DaemonCallError::Quarantined(msg)) => {
+                return Err(BinError::DaemonQuarantined(msg));
+            }
+            Err(DaemonCallError::Unreachable(msg)) if cli.fallback_direct => {
+                eprintln!(
+                    "zervram-scrub: warning: daemon {daemon_url} unreachable ({msg}); falling back to direct cold scrub"
+                );
+            }
+            Err(DaemonCallError::Unreachable(msg) | DaemonCallError::Failed(msg)) => {
+                return Err(BinError::DaemonRpc(msg));
+            }
+        }
+    }
+
     let (signer_obj, created_key) = Ed25519Signer::load_or_generate_key_file(&cli.key_file)?;
     let pubkey_hex = signer_obj.verifying_key_hex();
     if created_key {
@@ -269,8 +629,6 @@ async fn run_scrub(cli: Cli) -> Result<(), BinError> {
         }));
     }
 
-    // In explicit --allow-mock mode, simulate a departing tenant job tainting VRAM so the full
-    // dirty -> zeroize -> 4 KiB 0x00 verification pipeline executes end-to-end.
     if hal.backend_kind() == BackendKind::MockCpu && target.state == DeviceState::Available {
         let _ = hal
             .allocate_slice(
@@ -307,49 +665,13 @@ async fn run_scrub(cli: Cli) -> Result<(), BinError> {
         certificate: cert,
     };
 
-    let json_text = serde_json::to_string_pretty(&bundle)?;
-
-    if let Some(out_path) = &cli.out_cert {
-        if let Some(parent) = out_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        std::fs::write(out_path, json_text.as_bytes())?;
-    }
-
-    if cli.json {
-        println!("{json_text}");
-    } else {
-        println!("ZERVRAM VRAM SANITIZATION VERIFIED (v2)");
-        println!("  Schema           : {}", bundle.certificate.schema_version);
-        println!("  Backend          : {:?}", bundle.certificate.backend_kind);
-        println!(
-            "  Device [{}]       : {} ({})",
-            bundle.certificate.device_ordinal,
-            bundle.certificate.vendor_model,
-            bundle.certificate.device_uuid
-        );
-        println!(
-            "  Swept / Free     : {} / {} bytes ({} chunks)",
-            bundle.certificate.swept_bytes,
-            bundle.certificate.vram_free_bytes,
-            bundle.certificate.chunk_count
-        );
-        println!(
-            "  Verification     : {:?} ({} bytes verified, {} canary pages)",
-            bundle.certificate.verification_mode,
-            bundle.certificate.verified_bytes,
-            bundle.certificate.sampled_pages
-        );
-        println!("  Duration         : {} us", bundle.certificate.duration_us);
-        println!("  Prev Cert SHA256 : {}", bundle.certificate.prev_cert_sha256);
-        println!("  Cert SHA-256     : {}", bundle.certificate_sha256);
-        println!("  Chain File       : {}", chain_path.display());
-        println!("  Ed25519 PubKey   : {}", bundle.ed25519_public_key_hex);
-    }
-
-    Ok(())
+    emit_bundle(
+        &bundle,
+        cli.out_cert.as_deref(),
+        cli.json,
+        "Chain File",
+        &chain_path.display().to_string(),
+    )
 }
 
 fn run_verify(
@@ -447,9 +769,8 @@ fn exit_code_for_error(err: &BinError) -> ExitCode {
     match err {
         BinError::Scrub(ScrubError::ResidualDataDetected { .. })
         | BinError::Scrub(ScrubError::DeviceQuarantined { .. })
-        | BinError::Hal(HalError::HardwareFaultQuarantine { .. }) => {
-            ExitCode::from(EXIT_CODE_QUARANTINED)
-        }
+        | BinError::Hal(HalError::HardwareFaultQuarantine { .. })
+        | BinError::DaemonQuarantined(_) => ExitCode::from(EXIT_CODE_QUARANTINED),
         _ => ExitCode::FAILURE,
     }
 }

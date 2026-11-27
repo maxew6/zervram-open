@@ -11,6 +11,10 @@ repository.workspace = true
 name = "zervram-scrub"
 path = "src/bin/zervram-scrub.rs"
 
+[[bin]]
+name = "zervramd"
+path = "src/bin/zervramd.rs"
+
 [lints]
 workspace = true
 
